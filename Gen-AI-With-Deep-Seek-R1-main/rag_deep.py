@@ -1,11 +1,18 @@
 import streamlit as st
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.vectorstores import InMemoryVectorStore
+# from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_ollama import OllamaEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama.llms import OllamaLLM
-
+# from langchain_ollama.llms import OllamaLLM
+import faiss
+from docling.document_converter import DocumentConverter
+from langchain_text_splitters import MarkdownHeaderTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_ollama import ChatOllama
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 st.markdown("""
     <style>
     .stApp {
@@ -73,9 +80,9 @@ Context: {document_context}
 Answer:
 """
 PDF_STORAGE_PATH = 'document_store/pdfs/'
-EMBEDDING_MODEL = OllamaEmbeddings(model="deepseek-r1:1.5b")
-DOCUMENT_VECTOR_DB = InMemoryVectorStore(EMBEDDING_MODEL)
-LANGUAGE_MODEL = OllamaLLM(model="deepseek-coder")
+# EMBEDDING_MODEL = OllamaEmbeddings(model="deepseek-r1:1.5b")
+# DOCUMENT_VECTOR_DB = InMemoryVectorStore(EMBEDDING_MODEL)
+# LANGUAGE_MODEL = OllamaLLM(model="deepseek-r1:1.5b")
 
 
 def save_uploaded_file(uploaded_file):
@@ -90,6 +97,12 @@ def load_pdf_documents(file_path):
     return document_loader.load()
 
 
+def load_and_convert_document(file_path):
+    converter = DocumentConverter()
+    result = converter.convert(file_path)
+    return result.document.export_to_markdown()
+
+
 def chunk_documents(raw_documents):
     text_processor = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -97,6 +110,33 @@ def chunk_documents(raw_documents):
         add_start_index=True
     )
     return text_processor.split_documents(raw_documents)
+
+# Splitting markdown content into chunks
+
+
+def get_markdown_splits(markdown_content):
+    headers_to_split_on = [
+        ("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]
+    markdown_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on, strip_headers=False)
+    return markdown_splitter.split_text(markdown_content)
+
+# Embedding and vector store setup
+
+
+def setup_vector_store(chunks):
+    embeddings = OllamaEmbeddings(
+        model='nomic-embed-text', base_url="http://localhost:11434")
+    single_vector = embeddings.embed_query("this is some text data")
+    index = faiss.IndexFlatL2(len(single_vector))
+    vector_store = FAISS(
+        embedding_function=embeddings,
+        index=index,
+        docstore=InMemoryDocstore(),
+        index_to_docstore_id={}
+    )
+    vector_store.add_documents(documents=chunks)
+    return vector_store
 
 
 def index_documents(document_chunks):
@@ -112,6 +152,38 @@ def generate_answer(user_query, context_documents):
     conversation_prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
     response_chain = conversation_prompt | LANGUAGE_MODEL
     return response_chain.invoke({"user_query": user_query, "document_context": context_text})
+
+# Formatting documents for RAG
+
+
+def format_docs(docs):
+    return "\n\n".join([doc.page_content for doc in docs])
+
+# Setting up the RAG chain
+
+
+def create_rag_chain(retriever):
+    prompt = """
+        You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question.
+        If you don't know the answer, just say that you don't know.
+        Answer in bullet points. Make sure your answer is relevant to the question and it is answered from the context only.
+        ### Question: {question} 
+        
+        ### Context: {context} 
+        
+        ### Answer:
+    """
+    model = ChatOllama(model="deepseek-r1:1.5b",
+                       base_url="http://localhost:11434")
+    prompt_template = ChatPromptTemplate.from_template(prompt)
+
+    chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt_template
+        | model
+        | StrOutputParser()
+    )
+    return chain
 
 
 # UI Configuration
@@ -132,9 +204,16 @@ uploaded_pdf = st.file_uploader(
 
 if uploaded_pdf:
     saved_path = save_uploaded_file(uploaded_pdf)
-    raw_docs = load_pdf_documents(saved_path)
-    processed_chunks = chunk_documents(raw_docs)
-    index_documents(processed_chunks)
+    markdown_content = load_and_convert_document(saved_path)
+    chunks = get_markdown_splits(markdown_content)
+    vector_store = setup_vector_store(chunks)
+    # Setup retriever
+    retriever = vector_store.as_retriever(
+        search_type="mmr", search_kwargs={'k': 3})
+    rag_chain = create_rag_chain(retriever)
+    # raw_docs = load_pdf_documents(saved_path)
+    # processed_chunks = chunk_documents(raw_docs)
+    # index_documents(processed_chunks)
 
     st.success("✅ Document processed successfully! Ask your questions below.")
 
@@ -145,8 +224,12 @@ if uploaded_pdf:
             st.write(user_input)
 
         with st.spinner("Analyzing document..."):
-            relevant_docs = find_related_documents(user_input)
-            ai_response = generate_answer(user_input, relevant_docs)
+            # relevant_docs = find_related_documents(user_input)
+            # ai_response = generate_answer(user_input, relevant_docs)
+            ai_response = ""  # Initialize an empty response string
+
+            for chunk in rag_chain.invoke(user_input):
+                ai_response += chunk  # Append each chunk to form the complete response
 
         with st.chat_message("assistant", avatar="🤖"):
             st.write(ai_response)
