@@ -1,0 +1,9 @@
+documents/
+__pycache__/
+venv/
+# jupyter notebook checkpoints
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+# FAISS indices
+**/*.faiss
+**/*.pkl
